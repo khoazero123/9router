@@ -40,7 +40,7 @@ const CODEX_PASSTHROUGH_TOOL_TYPES = new Set(["custom"]);
 // Allowlist of fields accepted by Codex Responses API — anything else is stripped
 const RESPONSES_API_ALLOWLIST = new Set([
   "model", "input", "instructions", "tools", "tool_choice", "stream", "store",
-  "reasoning", "service_tier", "include", "prompt_cache_key", "client_metadata",
+  "service_tier", "prompt_cache_key", "client_metadata",
   "text"
 ]);
 
@@ -438,19 +438,27 @@ export class CodexExecutor extends BaseExecutor {
       }
     }
 
-    // Priority: explicit reasoning.effort > reasoning_effort param > model suffix > default (medium)
-    if (!body.reasoning) {
-      const effort = normalizeReasoningEffort(body.reasoning_effort || modelEffort || 'low');
-      body.reasoning = { effort, summary: "auto" };
-    } else {
-      body.reasoning.effort = normalizeReasoningEffort(body.reasoning.effort);
-      if (!body.reasoning.summary) body.reasoning.summary = "auto";
-    }
+    // The current Codex Responses endpoint rejects reasoning controls for
+    // this route (including ordinary Cursor "hi" requests). Delete them before
+    // and after all conversions so no stale field can survive.
     delete body.reasoning_effort;
-
-    // Include reasoning encrypted content (required by Codex backend for reasoning models)
-    if (body.reasoning && body.reasoning.effort && body.reasoning.effort !== 'none') {
-      body.include = ["reasoning.encrypted_content"];
+    delete body.reasoning;
+    delete body.include;
+    if (Array.isArray(body.input)) {
+      for (const item of body.input) {
+        if (!item || typeof item !== "object") continue;
+        delete item.reasoning_effort;
+        delete item.reasoning;
+        delete item.include;
+        if (Array.isArray(item.content)) {
+          for (const part of item.content) {
+            if (!part || typeof part !== "object") continue;
+            delete part.reasoning_effort;
+            delete part.reasoning;
+            delete part.include;
+          }
+        }
+      }
     }
 
     // Remove unsupported parameters for Codex API

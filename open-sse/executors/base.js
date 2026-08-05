@@ -126,6 +126,31 @@ export class BaseExecutor {
     for (let urlIndex = 0; urlIndex < fallbackCount; urlIndex++) {
       const url = this.buildUrl(model, stream, urlIndex, credentials);
       const transformedBody = this.transformRequest(model, body, stream, credentials);
+      // Last-mile guard: OpenAI chat completions rejects GPT-5/o-series function
+      // tools with reasoning_effort unless effort is "none". Keep this directly
+      // next to JSON.stringify/fetch so no earlier translation/executor mutation can
+      // reintroduce an unsupported value.
+      if (transformedBody && typeof transformedBody === "object") {
+        const m = String(transformedBody.model || model || "").toLowerCase();
+        const hasReasoningModel = m.includes("gpt-5") || m.includes("o1") || m.includes("o3") || m.includes("o4");
+        const hasFunctionTools =
+          (Array.isArray(transformedBody.tools) && transformedBody.tools.length > 0) ||
+          (Array.isArray(transformedBody.functions) && transformedBody.functions.length > 0);
+        // Codex Responses rejects reasoning controls entirely. This guard is
+        // deliberately last-mile, immediately before JSON.stringify/fetch.
+        const isCodexResponses = String(this.provider || "").toLowerCase() === "codex"
+          || String(url || "").includes("/codex/responses");
+        if (isCodexResponses) {
+          delete transformedBody.reasoning_effort;
+          delete transformedBody.reasoning;
+          delete transformedBody.include;
+        } else if (hasReasoningModel && hasFunctionTools) {
+          transformedBody.reasoning_effort = "none";
+          if (transformedBody.reasoning && typeof transformedBody.reasoning === "object") {
+            transformedBody.reasoning.effort = "none";
+          }
+        }
+      }
       const headers = this.buildHeaders(credentials, stream, url);
 
       if (!retryAttemptsByUrl[urlIndex]) retryAttemptsByUrl[urlIndex] = 0;

@@ -82,10 +82,77 @@ export class DefaultExecutor extends BaseExecutor {
     super(provider, PROVIDERS[provider] || PROVIDERS.openai);
   }
 
+  // Newer OpenAI reasoning models reject max_tokens and require max_completion_tokens.
+  // Keep this here (not only in the GitHub executor) so first-party OpenAI and
+  // OpenAI-compatible routes used by dashboard model tests are normalized too.
+  requiresMaxCompletionTokens(model) {
+    return /(^|[-_/])(gpt-5|o[134])-|^gpt-5|^o[134]-/i.test(model || "");
+  }
+
+  // OpenAI chat completions rejects function tools together with reasoning_effort
+  // for some GPT-5 family models. Cursor sends both when pointed at an
+  // OpenAI-compatible endpoint. Keep tools working by disabling reasoning for
+  // that chat-completions request; clients that need reasoning + tools should
+  // use /v1/responses instead.
+  requiresNoReasoningEffortWithTools(model) {
+    const m = String(model || "").toLowerCase();
+    return m.includes("gpt-5") || m.includes("o1") || m.includes("o3") || m.includes("o4");
+  }
+
+  hasFunctionTools(body) {
+    const hasTools = Array.isArray(body?.tools) && body.tools.some((tool) =>
+      tool?.type === "function" || tool?.function || (!tool?.type && tool?.name)
+    );
+    const hasFunctions = Array.isArray(body?.functions) && body.functions.length > 0;
+    return hasTools || hasFunctions;
+  }
+
+  // OpenAI's chat-completions image part schema is strict: image content parts
+  // may only contain {type, image_url}, and image_url may only contain {url,
+  // detail}. Cursor sometimes forwards provider-specific fields (for example
+  // providerOptions, id, name, mime_type, data, dimensions). Those fields are
+  // valid in Cursor's internal envelope but are rejected by OpenAI with
+  // "Unexpected keys in a message content image dict".
+  sanitizeOpenAIImageParts(body) {
+    if (!body || !Array.isArray(body.messages)) return body;
+    const transformed = { ...body };
+    transformed.messages = body.messages.map((message) => {
+      if (!Array.isArray(message?.content)) return message;
+      const content = message.content.map((part) => {
+        if (part?.type !== "image_url" || !part.image_url || typeof part.image_url !== "object") return part;
+        const imageUrl = { url: part.image_url.url };
+        if (part.image_url.detail !== undefined) imageUrl.detail = part.image_url.detail;
+        return { type: "image_url", image_url: imageUrl };
+      });
+      return { ...message, content };
+    });
+    return transformed;
+  }
+
   transformRequest(model, body) {
-    const transformed = this.applyJsonSchemaFallback(body);
+    const transformedBody = this.sanitizeOpenAIImageParts(body);
+    const transformed = this.applyJsonSchemaFallback(transformedBody);
 
     if (transformed && typeof transformed === "object") {
+      const modelLower = String(model || "").toLowerCase();
+      const isReasoningModel = modelLower.includes("gpt-5") || modelLower.includes("o1") || modelLower.includes("o3") || modelLower.includes("o4");
+
+      if (isReasoningModel && transformed.max_tokens !== undefined) {
+        transformed.max_completion_tokens = transformed.max_tokens;
+        delete transformed.max_tokens;
+      }
+      if (
+        this.requiresNoReasoningEffortWithTools(model) &&
+        this.hasFunctionTools(transformed) &&
+        (transformed.reasoning_effort || (transformed.reasoning && typeof transformed.reasoning === "object"))
+      ) {
+        if (transformed.reasoning_effort && transformed.reasoning_effort !== "none") {
+          transformed.reasoning_effort = "none";
+        }
+        if (transformed.reasoning && typeof transformed.reasoning === "object") {
+          transformed.reasoning.effort = "none";
+        }
+      }
       // quirk: some openai-compatible providers reject Anthropic's client_metadata field
       if (this.config.quirks?.dropClientMetadata) {
         delete transformed.client_metadata;

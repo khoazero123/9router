@@ -29,6 +29,7 @@ import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { stripUnsupportedModalities } from "../translator/concerns/modality.js";
 import { prefetchRemoteImages } from "../translator/concerns/prefetch.js";
 import { extractThinking } from "../translator/concerns/thinkingUnified.js";
+import { stripUnsupportedParams } from "../translator/concerns/paramSupport.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
 
 /**
@@ -163,7 +164,48 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   // Covers both passthrough (source shape) and translated (target shape) flows
   const finalFormat = passthrough ? sourceFormat : targetFormat;
 
+  // Final provider/model-specific request normalization before logging and dispatch.
+  // Some normalizers live in generic executors, but this must also cover the common
+  // OpenAI route after translation and before token savers. Cursor sends tools with
+  // reasoning_effort to /v1/chat/completions; OpenAI GPT-5 rejects that unless the
+  // effort is explicitly "none".
+  stripUnsupportedParams(provider, translatedBody.model || model, translatedBody);
+
+  // OpenAI Chat Completions accepts only `url` and optional `detail` inside
+  // image_url. Cursor may put metadata directly in that nested object. Sanitize
+  // at the final pre-dispatch boundary so this also covers passthrough and any
+  // translator that bypasses DefaultExecutor.transformRequest.
+  if (Array.isArray(translatedBody.messages)) {
+    translatedBody.messages = translatedBody.messages.map((message) => {
+      if (!Array.isArray(message?.content)) return message;
+      return {
+        ...message,
+        content: message.content.map((part) => {
+          if (part?.type !== "image_url" || !part.image_url || typeof part.image_url !== "object") return part;
+          const imageUrl = { url: part.image_url.url };
+          if (part.image_url.detail !== undefined) imageUrl.detail = part.image_url.detail;
+          // OpenAI Chat Completions is strict: image content parts may only
+          // contain type + image_url. Cursor can add sibling metadata such as
+          // providerOptions, which OpenAI reports as unexpected image dict keys.
+          return { type: "image_url", image_url: imageUrl };
+        }),
+      };
+    });
+  }
+
   // Request line: one correlated summary (fmt + thinking + counts + account)
+  if (reqLogger?.logFinalInput) {
+    reqLogger.logFinalInput({
+      endpoint: clientRawRequest?.endpoint,
+      provider,
+      model,
+      sourceFormat,
+      targetFormat,
+      passthrough,
+      body: translatedBody,
+    });
+  }
+
   if (log?.line) {
     const clientModel = clientRawRequest?.body?.model || `${provider}/${model}`;
     const msgN = translatedBody.messages?.length || translatedBody.input?.length || translatedBody.contents?.length || body.messages?.length || body.input?.length || 0;

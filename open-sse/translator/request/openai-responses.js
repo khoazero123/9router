@@ -1,6 +1,6 @@
 /**
  * Translator: OpenAI Responses API → OpenAI Chat Completions
- * 
+ *
  * Responses API uses: { input: [...], instructions: "..." }
  * Chat API uses: { messages: [...] }
  */
@@ -378,8 +378,10 @@ export function openaiToOpenAIResponsesRequest(model, body, stream, credentials)
   if (body.temperature !== undefined) result.temperature = body.temperature;
   if (body.max_tokens !== undefined) result.max_tokens = body.max_tokens;
   if (body.top_p !== undefined) result.top_p = body.top_p;
-  if (body.reasoning !== undefined) result.reasoning = body.reasoning;
-  if (body.reasoning_effort !== undefined) result.reasoning = { effort: body.reasoning_effort, summary: "auto" };
+  // Codex Responses currently rejects reasoning controls. The Codex executor
+  // strips these again defensively, but do not synthesize a reasoning object
+  // during the OpenAI Chat Completions → Responses translation.
+  if (body.reasoning !== undefined && body.reasoning_effort === undefined) result.reasoning = body.reasoning;
   if (body.service_tier !== undefined) result.service_tier = body.service_tier;
 
   return result;

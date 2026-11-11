@@ -13,6 +13,60 @@ const origCreate = http.createServer.bind(http);
 const PEER_TOKEN = crypto.randomBytes(24).toString("hex");
 process.env.NINEROUTER_PEER_TOKEN = PEER_TOKEN;
 
+// --- trusted reverse proxy handling -------------------------------------------
+// Comma-separated peer addresses (IPs or IPv4 CIDR blocks) allowed to supply
+// forwarding headers. Any other socket peer is keyed by its own address.
+const DEFAULT_TRUSTED_PROXIES = "127.0.0.1,::1,10.10.20.0/24";
+const TRUSTED_PROXIES = String(process.env.NINEROUTER_TRUSTED_PROXIES || DEFAULT_TRUSTED_PROXIES)
+  .split(",")
+  .map((v) => v.trim())
+  .filter(Boolean);
+
+function normalizeIp(value) {
+  let ip = String(value || "").trim();
+  if (!ip) return "";
+  if (ip.startsWith("::ffff:")) ip = ip.slice(7);
+  const zone = ip.indexOf("%");
+  if (zone !== -1) ip = ip.slice(0, zone);
+  if (ip.startsWith("[") && ip.includes("]")) ip = ip.slice(1, ip.indexOf("]"));
+  return ip;
+}
+
+const IPV4_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+
+function ipv4ToInt(value) {
+  const m = IPV4_RE.exec(value);
+  if (!m) return null;
+  const parts = m.slice(1).map((n) => Number(n));
+  if (parts.some((n) => n > 255)) return null;
+  return ((parts[0] << 24) >>> 0) + (parts[1] << 16) + (parts[2] << 8) + parts[3];
+}
+
+function isIpLiteral(value) {
+  const ip = normalizeIp(value);
+  if (!ip) return false;
+  if (ipv4ToInt(ip) !== null) return true;
+  return /^[0-9a-fA-F:]+$/.test(ip) && ip.includes(":");
+}
+
+function isTrustedProxy(socketIp) {
+  const peer = normalizeIp(socketIp);
+  if (!peer) return false;
+  const peerInt = ipv4ToInt(peer);
+  for (const rule of TRUSTED_PROXIES) {
+    if (rule === peer) return true;
+    const slash = rule.indexOf("/");
+    if (slash === -1) continue;
+    const baseInt = ipv4ToInt(rule.slice(0, slash));
+    const bits = Number(rule.slice(slash + 1));
+    if (baseInt === null || peerInt === null) continue;
+    if (!Number.isInteger(bits) || bits < 0 || bits > 32) continue;
+    const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
+    if (((peerInt & mask) >>> 0) === ((baseInt & mask) >>> 0)) return true;
+  }
+  return false;
+}
+
 let backgroundRefreshStarted = false;
 
 function startBackgroundTokenRefreshFromCustomServer() {
@@ -58,18 +112,22 @@ http.createServer = (...args) => {
     const xff = req.headers["x-forwarded-for"];
     const xRealIp = req.headers["x-real-ip"];
     const viaProxy = !!(xff || xRealIp);
-    const isLoopbackProxy = socketIp === "127.0.0.1" || socketIp === "::1" || socketIp === "::ffff:127.0.0.1";
-    // Trust forwarding headers only when the TCP peer is a local reverse proxy.
-    // Direct/public sockets remain keyed by the unspoofable peer address.
-    const proxyIp = xRealIp || (xff ? String(xff).split(",")[0].trim() : "");
-    const ip = isLoopbackProxy && proxyIp ? proxyIp : socketIp;
+    // Trust forwarding headers only when the TCP peer is a known reverse proxy AND the
+    // claimed client address is a literal IP. Direct/public sockets are keyed by the
+    // unspoofable peer address, so a client cannot rotate forwarding headers to escape
+    // its own lockout bucket. XFF is taken from the right-most hop: entries further left
+    // are attacker-controlled.
+    const claimedIp = normalizeIp(xRealIp || (xff ? String(xff).split(",").pop().trim() : ""));
+    const trusted = isTrustedProxy(socketIp) && isIpLiteral(claimedIp);
+    const ip = trusted ? claimedIp : normalizeIp(socketIp);
     delete req.headers["x-9r-real-ip"];
     delete req.headers["x-forwarded-for"];
+    delete req.headers["x-real-ip"];
     delete req.headers["x-9r-via-proxy"];
     delete req.headers["x-9r-peer-token"];
     req.headers["x-9r-real-ip"] = ip;
     req.headers["x-9r-peer-token"] = PEER_TOKEN;
-    if (viaProxy) req.headers["x-9r-via-proxy"] = "1";
+    if (viaProxy && trusted) req.headers["x-9r-via-proxy"] = "1";
     return handler(req, res);
   };
   const server = origCreate(...rest, wrapped);
